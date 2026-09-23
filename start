@@ -157,12 +157,12 @@ void checkSchedules() {
 }
 
 class ServerCallbacks : public NimBLEServerCallbacks {
-  void onConnect(NimBLEServer*) override {
+  void onConnect(NimBLEServer*, NimBLEConnInfo&) override {
     clientConnected = true;
     sendResponse("EVENT CONNECTED");
   }
 
-  void onDisconnect(NimBLEServer*) override {
+  void onDisconnect(NimBLEServer*, NimBLEConnInfo&, int) override {
     clientConnected = false;
     NimBLEDevice::startAdvertising();
   }
@@ -207,7 +207,6 @@ void setupBle() {
 
   NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
   advertising->addServiceUUID(SERVICE_UUID);
-  advertising->setScanResponse(true);
   advertising->start();
   Serial.println("BLE advertising as 'Message Player'");
 }
