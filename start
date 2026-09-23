@@ -1,1 +1,225 @@
+/*
+ * ESP32-S3 BLE interface for the Message Player with Scheduler
+ *
+ * Arduino-ESP32 + NimBLE-Arduino
+ *
+ * ESP32-S3 supports Bluetooth Low Energy (BLE), not Bluetooth Classic/SPP.
+ * Install the NimBLE-Arduino library before compiling.
+ *
+ * BLE service:        6e400001-b5a3-f393-e0a9-e50e24dcca9e
+ * Command (write):    6e400002-b5a3-f393-e0a9-e50e24dcca9e
+ * Events (notify):    6e400003-b5a3-f393-e0a9-e50e24dcca9e
+ *
+ * Commands are UTF-8, one per write/line:
+ *   PLAY <message>
+ *   STOP
+ *   STATUS
+ *   SCHEDULE ADD <unix-seconds> <message>
+ *   SCHEDULE LIST
+ *   SCHEDULE CLEAR
+ *
+ * Responses/events are newline terminated. The actual audio output can be
+ * connected by replacing playerPlay() and playerStop().
+ */
 
+#include <Arduino.h>
+#include <NimBLEDevice.h>
+#include <time.h>
+
+static constexpr char DEVICE_NAME[] = "Message Player";
+static constexpr char SERVICE_UUID[] = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+static constexpr char RX_UUID[]      = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
+static constexpr char TX_UUID[]      = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
+static constexpr size_t MAX_MESSAGE = 180;
+static constexpr size_t MAX_SCHEDULES = 16;
+
+struct ScheduledMessage {
+  bool used = false;
+  time_t at = 0;
+  char message[MAX_MESSAGE + 1] = {};
+};
+
+NimBLECharacteristic* txCharacteristic = nullptr;
+NimBLEServer* bleServer = nullptr;
+ScheduledMessage schedules[MAX_SCHEDULES];
+String inputBuffer;
+volatile bool clientConnected = false;
+String currentMessage;
+
+void sendResponse(const String& response) {
+  Serial.println(response);
+  if (clientConnected && txCharacteristic != nullptr) {
+    // Keep notifications below the common BLE MTU payload size.
+    for (size_t offset = 0; offset < response.length(); offset += 180) {
+      String part = response.substring(offset, offset + 180);
+      txCharacteristic->setValue(part.c_str());
+      txCharacteristic->notify();
+      delay(2);
+    }
+    txCharacteristic->setValue("\n");
+    txCharacteristic->notify();
+  }
+}
+
+// Replace these two functions with the project’s DAC/I2S/DFPlayer code.
+void playerPlay(const char* message) {
+  currentMessage = message;
+  Serial.printf("PLAY: %s\n", message);
+}
+
+void playerStop() {
+  currentMessage = "";
+  Serial.println("STOP");
+}
+
+void listSchedules() {
+  sendResponse("SCHEDULES");
+  for (size_t i = 0; i < MAX_SCHEDULES; ++i) {
+    if (schedules[i].used) {
+      sendResponse(String(i) + " " + String((long long)schedules[i].at) + " " + schedules[i].message);
+    }
+  }
+  sendResponse("END");
+}
+
+void addSchedule(time_t at, const String& message) {
+  if (message.isEmpty() || message.length() > MAX_MESSAGE || at <= 0) {
+    sendResponse("ERR invalid schedule");
+    return;
+  }
+
+  for (size_t i = 0; i < MAX_SCHEDULES; ++i) {
+    if (!schedules[i].used) {
+      schedules[i].used = true;
+      schedules[i].at = at;
+      message.toCharArray(schedules[i].message, sizeof(schedules[i].message));
+      sendResponse("OK SCHEDULE " + String(i));
+      return;
+    }
+  }
+  sendResponse("ERR schedule full");
+}
+
+void processCommand(String command) {
+  command.trim();
+  if (command.isEmpty()) return;
+
+  if (command.equalsIgnoreCase("STOP")) {
+    playerStop();
+    sendResponse("OK STOP");
+  } else if (command.equalsIgnoreCase("STATUS")) {
+    sendResponse("STATUS connected=" + String(clientConnected ? 1 : 0) +
+                 " playing=" + String(currentMessage.isEmpty() ? 0 : 1) +
+                 " message=" + currentMessage);
+  } else if (command.equalsIgnoreCase("SCHEDULE LIST")) {
+    listSchedules();
+  } else if (command.equalsIgnoreCase("SCHEDULE CLEAR")) {
+    for (auto& schedule : schedules) schedule.used = false;
+    sendResponse("OK SCHEDULE CLEAR");
+  } else if (command.startsWith("PLAY ")) {
+    String message = command.substring(5);
+    message.trim();
+    if (message.isEmpty() || message.length() > MAX_MESSAGE) {
+      sendResponse("ERR message must be 1-180 characters");
+    } else {
+      playerPlay(message.c_str());
+      sendResponse("OK PLAY");
+    }
+  } else if (command.startsWith("SCHEDULE ADD ")) {
+    String arguments = command.substring(13);
+    int separator = arguments.indexOf(' ');
+    if (separator <= 0) {
+      sendResponse("ERR use: SCHEDULE ADD <unix-seconds> <message>");
+      return;
+    }
+    time_t at = (time_t)arguments.substring(0, separator).toInt();
+    String message = arguments.substring(separator + 1);
+    message.trim();
+    addSchedule(at, message);
+  } else {
+    sendResponse("ERR unknown command");
+  }
+}
+
+void checkSchedules() {
+  static time_t lastCheck = 0;
+  time_t now = time(nullptr);
+  if (now <= 0 || now == lastCheck) return;
+  lastCheck = now;
+
+  for (auto& schedule : schedules) {
+    if (schedule.used && schedule.at <= now) {
+      playerPlay(schedule.message);
+      sendResponse("EVENT PLAY " + String(schedule.message));
+      schedule.used = false; // one-shot schedule
+    }
+  }
+}
+
+class ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer*) override {
+    clientConnected = true;
+    sendResponse("EVENT CONNECTED");
+  }
+
+  void onDisconnect(NimBLEServer*) override {
+    clientConnected = false;
+    NimBLEDevice::startAdvertising();
+  }
+};
+
+class RxCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo&) override {
+    std::string value = characteristic->getValue();
+    for (char character : value) {
+      if (character == '\n' || character == '\r') {
+        processCommand(inputBuffer);
+        inputBuffer = "";
+      } else if (inputBuffer.length() < MAX_MESSAGE + 40) {
+        inputBuffer += character;
+      } else {
+        inputBuffer = "";
+        sendResponse("ERR command too long");
+      }
+    }
+    // Also accept a complete command written without a newline.
+    if (!inputBuffer.isEmpty() && value.find('\n') == std::string::npos &&
+        value.find('\r') == std::string::npos) {
+      processCommand(inputBuffer);
+      inputBuffer = "";
+    }
+  }
+};
+
+void setupBle() {
+  NimBLEDevice::init(DEVICE_NAME);
+  bleServer = NimBLEDevice::createServer();
+  bleServer->setCallbacks(new ServerCallbacks());
+
+  NimBLEService* service = bleServer->createService(SERVICE_UUID);
+  txCharacteristic = service->createCharacteristic(
+      TX_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
+  NimBLECharacteristic* rxCharacteristic = service->createCharacteristic(
+      RX_UUID, NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+  rxCharacteristic->setCallbacks(new RxCallbacks());
+  txCharacteristic->setValue("READY\n");
+  service->start();
+
+  NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
+  advertising->addServiceUUID(SERVICE_UUID);
+  advertising->setScanResponse(true);
+  advertising->start();
+  Serial.println("BLE advertising as 'Message Player'");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(250);
+  setupBle();
+  sendResponse("READY");
+}
+
+void loop() {
+  checkSchedules();
+  delay(50);
+}
